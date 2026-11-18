@@ -66,6 +66,19 @@ curl -sS -o "$WORK/old.json" -w 'HTTP %{http_code}\n' "$API/traces/$TRACE_ID"
 pretty <"$WORK/old.json" || cat "$WORK/old.json"
 
 echo
+echo "== verify the old report from sealed evidence (still reproducible, marked invalidated) =="
+curl -fsS -X POST "$API/traces/$TRACE_ID/verification" | pretty
+
+echo
+echo "== a late-registered sample cannot change the old report's verification =="
+curl -fsS -X POST "$API/intakes" \
+  -H 'Content-Type: application/json' \
+  -d "{\"samples\":[{\"sample_id\":\"S${RUN}-LATE\",\"batch_nos\":[\"B${RUN}-1001\"]}]}" \
+  | pretty
+curl -fsS -X POST "$API/traces/$TRACE_ID/verification" \
+  | python3 -c 'import json,sys; b=json.load(sys.stdin); print({"verifiable": b["verifiable"], "reproduced": b["reproduced"], "invalidated": b["invalidated"], "sealed_samples": b["sealed_evidence"]["sample_ids"]})'
+
+echo
 echo "== a fresh trace reflects the corrected batch =="
 curl -fsS -X POST "$API/traces" -H 'Content-Type: application/json' -d '{}' | pretty
 

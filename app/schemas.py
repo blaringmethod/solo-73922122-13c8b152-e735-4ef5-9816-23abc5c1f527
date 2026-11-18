@@ -397,6 +397,105 @@ class TraceListResponse(BaseModel):
     traces: list[TraceSummary]
 
 
+class VerificationReason(BaseModel):
+    """Why a trace cannot be verified from sealed evidence."""
+
+    code: str = Field(
+        description=(
+            "One of sealed_evidence_missing, trace_failed, trace_not_published,"
+            " pinned_batch_version_not_retained, sealed_evidence_inconsistent."
+        )
+    )
+    message: str
+
+
+class SealedEvidence(BaseModel):
+    """The ledger fragment frozen when the trace was accepted."""
+
+    sealed_at: datetime
+    source_sample_ids: list[str]
+    sample_ids: list[str] = Field(
+        description="Every sample known at acceptance, with its contamination"
+        " role represented by source_sample_ids."
+    )
+    sample_batch_links: dict[str, list[str]] = Field(
+        description="Batch number -> sample ids riding it, as sealed."
+    )
+    batch_versions: dict[str, int] = Field(
+        description="Pinned batch number -> version used by this trace."
+    )
+
+
+class FieldDifference(BaseModel):
+    field: str
+    published: str
+    recomputed: str
+
+
+class SampleDifference(BaseModel):
+    """One affected sample whose report and recomputation disagree."""
+
+    sample_id: str
+    field_differences: list[FieldDifference]
+    published: AffectedSample
+    recomputed: AffectedSample
+
+
+class VerificationComparison(BaseModel):
+    published_affected_count: int
+    recomputed_affected_count: int
+    samples_added: list[str] = Field(
+        description="Affected by the recomputation but absent from the report."
+    )
+    samples_removed: list[str] = Field(
+        description="In the report but no longer affected by the recomputation."
+    )
+    samples_changed: list[SampleDifference] = Field(
+        description="Shared samples whose arrival, deadline or path differ."
+    )
+
+
+class RecomputedTrace(BaseModel):
+    has_sources: bool
+    source_sample_ids: list[str]
+    affected_samples: list[AffectedSample]
+
+
+class VerificationResponse(BaseModel):
+    trace_id: int
+    status: str = Field(description="Lifecycle status of the trace record.")
+    verifiable: bool = Field(
+        description=(
+            "True only when sealed evidence and all pinned batch versions are"
+            " available and the original propagation rules could be rerun."
+        )
+    )
+    reasons: list[VerificationReason] = Field(
+        default_factory=list,
+        description="Populated when verifiable is false; the current ledger is"
+        " never used to fill these gaps.",
+    )
+    invalidated: bool = Field(
+        description=(
+            "True when a later correction superseded a pinned batch version."
+            " The historical recomputation stays available, but the report is"
+            " superseded and must not be used as a current conclusion."
+        )
+    )
+    invalidation_records: list[InvalidationInfo] = Field(default_factory=list)
+    sealed_evidence: SealedEvidence | None = None
+    recomputed: RecomputedTrace | None = None
+    comparison: VerificationComparison | None = None
+    reproduced: bool | None = Field(
+        default=None,
+        description=(
+            "True when every affected sample, earliest arrival, quarantine"
+            " deadline and path matches the published report. Null when the"
+            " trace is not verifiable."
+        ),
+    )
+
+
 class IntakeResponse(BaseModel):
     intake_id: int
     created_at: datetime

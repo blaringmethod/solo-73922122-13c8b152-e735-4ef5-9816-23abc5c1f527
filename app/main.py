@@ -9,6 +9,7 @@ Endpoints
 ``POST /traces``                   run a trace on a pinned snapshot
 ``GET  /traces``                    list accepted traces
 ``GET  /traces/{id}``               re-read a published snapshot result
+``POST /traces/{id}/verification``  re-derive a report from sealed evidence
 ``GET  /healthz``                   readiness probe
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import tracing
+from . import tracing, verification
 from .schemas import (
     AffectedSample,
     BatchCorrection,
@@ -39,6 +40,7 @@ from .schemas import (
     TraceRequest,
     TraceResponse,
     TraceSummary,
+    VerificationResponse,
 )
 from .store import (
     ConflictError,
@@ -76,13 +78,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "* Corrections are versioned (`seen_version` optimistic lock),"
             " replace the old record and invalidate snapshots pinned to it.\n"
             "* `POST /traces` pins a snapshot at acceptance time and publishes"
-            " results only when complete; failed traces expose no partial rows."
+            " results only when complete; failed traces expose no partial rows.\n"
+            "* At acceptance the samples, sample-batch links, sources and batch"
+            " versions are sealed as evidence. `POST /traces/{id}/verification`"
+            " reruns the original propagation rules on that evidence and the"
+            " retained batch versions only, reporting item-by-item differences;"
+            " later intakes cannot change the verdict, and reports lacking"
+            " sealed evidence are explicitly not verifiable."
         ),
         lifespan=lifespan,
         openapi_tags=[
             {"name": "intake", "description": "Register samples and batches."},
             {"name": "corrections", "description": "Versioned batch replacement."},
             {"name": "traces", "description": "Contamination trace snapshots."},
+            {
+                "name": "verification",
+                "description": (
+                    "Re-derive published reports from sealed evidence and"
+                    " retained batch versions."
+                ),
+            },
         ],
     )
     app.state.store = store
@@ -406,6 +421,22 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             for row in store.invalidations(trace_id)
         ]
+
+    @app.post(
+        "/traces/{trace_id}/verification",
+        response_model=VerificationResponse,
+        tags=["verification"],
+        summary=(
+            "Recompute a published report from its sealed evidence and report"
+            " differences"
+        ),
+        responses={404: {"model": ErrorBody, "description": "Unknown trace"}},
+    )
+    def verify_trace(trace_id: int) -> VerificationResponse:
+        bundle = store.verification_bundle(trace_id)
+        if bundle is None:
+            raise HTTPException(status_code=404, detail="trace not found")
+        return VerificationResponse(**verification.verify(bundle))
 
     return app
 

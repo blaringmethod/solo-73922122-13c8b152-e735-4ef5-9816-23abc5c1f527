@@ -139,6 +139,40 @@ def test_end_to_end_over_http(server):
         assert affected["S3"]["path"][-1]["destination"] == "cold-archive"
         assert affected["S3"]["path"][-1]["version"] == 2
 
+        # The old report is still verifiable from sealed evidence + retained v1
+        # rows, but is explicitly marked invalidated.
+        verification = http.post(f"/traces/{trace_id}/verification")
+        assert verification.status_code == 200, verification.text
+        verdict = verification.json()
+        assert verdict["verifiable"] is True
+        assert verdict["reproduced"] is True
+        assert verdict["invalidated"] is True
+        assert verdict["invalidation_records"][0]["batch_no"] == "B3"
+        assert [a["sample_id"] for a in verdict["recomputed"]["affected_samples"]] == [
+            "S2",
+            "S3",
+        ]
+
+        # A late-registered sample cannot alter the old report's verification.
+        intake_two = http.post(
+            "/intakes",
+            json={"samples": [{"sample_id": "S9", "batch_nos": ["B1"]}]},
+        )
+        assert intake_two.status_code == 201
+        again = http.post(f"/traces/{trace_id}/verification").json()
+        assert again["reproduced"] is True
+        assert "S9" not in again["sealed_evidence"]["sample_ids"]
+        assert again["comparison"]["recomputed_affected_count"] == 2
+
+        # The fresh report verifies against the corrected (v2) snapshot.
+        fresh_verification = http.post(
+            f"/traces/{fresh['trace_id']}/verification"
+        ).json()
+        assert fresh_verification["verifiable"] is True
+        assert fresh_verification["reproduced"] is True
+        assert fresh_verification["invalidated"] is False
+        assert fresh_verification["sealed_evidence"]["batch_versions"]["B3"] == 2
+
 
 def test_end_to_end_errors_are_structured(server):
     with httpx.Client(base_url=server, timeout=10) as http:

@@ -14,6 +14,12 @@ result; a failure leaves zero result rows.
 
 *Invalidation*: a correction marks every completed trace that pinned the
 superseded version. Reading such a trace returns 409 instead of stale data.
+
+*Sealed evidence*: at acceptance a trace also seals the samples, their
+sample-batch links, its contamination sources and the pinned batch versions
+(``trace_evidence``). Verification recomputes the result from this evidence and
+the retained batch versions alone; evidence missing for a pre-sealing report
+means the report is explicitly not verifiable.
 """
 from __future__ import annotations
 
@@ -99,6 +105,18 @@ CREATE TABLE IF NOT EXISTS trace_invalidations (
     invalidated_at TEXT NOT NULL,
     reason         TEXT NOT NULL,
     PRIMARY KEY (trace_id, batch_no, version)
+);
+
+-- Sealed evidence captured in the same transaction as trace acceptance.
+-- Verification may use only these rows plus the retained (superseded) batch
+-- versions; the live ledger is never read to fill gaps in an old report.
+CREATE TABLE IF NOT EXISTS trace_evidence (
+    trace_id     INTEGER PRIMARY KEY REFERENCES traces(id) ON DELETE CASCADE,
+    sealed_at    TEXT NOT NULL,
+    sources_json TEXT NOT NULL,
+    samples_json TEXT NOT NULL,
+    links_json   TEXT NOT NULL,
+    pinned_json  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -592,17 +610,37 @@ class Store:
                     )
                 resolved = list(sources)
 
+            now = iso(utcnow())
             cur = conn.execute(
                 "INSERT INTO traces(intake_id, status, accepted_at,"
                 " sources_json, pinned_json) VALUES (?, 'pending', ?, ?, ?)",
                 (
                     snapshot["intake_id"],
-                    iso(utcnow()),
+                    now,
                     json.dumps(resolved),
                     json.dumps(snapshot["pinned"], sort_keys=True),
                 ),
             )
-            return int(cur.lastrowid), snapshot, resolved
+            trace_id = int(cur.lastrowid)
+            # Seal the ledger as seen at acceptance. Later intakes (new
+            # samples or sample-batch links) mutate the active dataset but
+            # never these rows, so a late intake cannot change verification.
+            riders: dict[str, list[str]] = {}
+            for batch in snapshot["batches"]:
+                riders[batch["batch_no"]] = list(batch["samples"])
+            conn.execute(
+                "INSERT INTO trace_evidence(trace_id, sealed_at, sources_json,"
+                " samples_json, links_json, pinned_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    trace_id,
+                    now,
+                    json.dumps(resolved),
+                    json.dumps(snapshot["all_sample_ids"]),
+                    json.dumps(riders, sort_keys=True),
+                    json.dumps(snapshot["pinned"], sort_keys=True),
+                ),
+            )
+            return trace_id, snapshot, resolved
 
     @staticmethod
     def _snapshot_in(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -785,12 +823,60 @@ class Store:
             finally:
                 conn.execute("COMMIT")
 
+    def verification_bundle(self, trace_id: int) -> dict[str, Any] | None:
+        """Load everything a verification needs, in one read transaction.
+
+        The bundle contains the trace header, its stored result rows, the
+        sealed evidence captured at acceptance, its invalidation markers and
+        *every retained batch version* (including superseded rows) for the
+        trace's intake. The recomputation itself must pick the pinned version
+        of each batch; the live ledger is not consulted.
+
+        Returns ``None`` when the trace does not exist. ``evidence`` is
+        ``None`` for reports published before evidence sealing existed, which
+        the API must report as not verifiable rather than reconstruct.
+        """
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                trace = conn.execute(
+                    "SELECT * FROM traces WHERE id=?", (trace_id,)
+                ).fetchone()
+                if trace is None:
+                    return None
+                evidence = conn.execute(
+                    "SELECT * FROM trace_evidence WHERE trace_id=?", (trace_id,)
+                ).fetchone()
+                results = conn.execute(
+                    "SELECT * FROM trace_results WHERE trace_id=? ORDER BY rank",
+                    (trace_id,),
+                ).fetchall()
+                invalidations = conn.execute(
+                    "SELECT * FROM trace_invalidations WHERE trace_id=?"
+                    " ORDER BY invalidated_at, batch_no",
+                    (trace_id,),
+                ).fetchall()
+                batches = conn.execute(
+                    "SELECT batch_no, version, origin, destination, departed_at,"
+                    " arrived_at, superseded FROM batches WHERE intake_id=?"
+                    " ORDER BY batch_no, version",
+                    (int(trace["intake_id"]),),
+                ).fetchall()
+                return {
+                    "trace": trace,
+                    "evidence": evidence,
+                    "results": results,
+                    "invalidations": invalidations,
+                    "batches": [dict(row) for row in batches],
+                }
+            finally:
+                conn.execute("COMMIT")
+
     def trace(self, trace_id: int) -> sqlite3.Row | None:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT * FROM traces WHERE id=?", (trace_id,)
             ).fetchone()
-
     def trace_results(self, trace_id: int) -> list[sqlite3.Row]:
         with self.connection() as conn:
             return conn.execute(
